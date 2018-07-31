@@ -1,0 +1,155 @@
+From 898e2a344b8d86771c5544a505bf98c2ecc6eb04 Mon Sep 17 00:00:00 2001
+From: kashike <kashike@vq.lc>
+Date: Mon, 30 Jul 2018 21:51:06 -0700
+Subject: [PATCH] Add support for Velocity
+
+
+diff --git a/src/main/java/com/destroystokyo/paper/PaperConfig.java b/src/main/java/com/destroystokyo/paper/PaperConfig.java
+index f7ece47ed..8ec5d9bc3 100644
+--- a/src/main/java/com/destroystokyo/paper/PaperConfig.java
++++ b/src/main/java/com/destroystokyo/paper/PaperConfig.java
+@@ -327,4 +327,9 @@ public class PaperConfig {
+             logger.log(Level.INFO, "******************************************************");
+         }
+     }
++
++    public static boolean useVelocityProxy;
++    private static void useVelocityProxy() {
++        useVelocityProxy = getBoolean("settings.use-velocity-proxy", useVelocityProxy);
++    }
+ }
+diff --git a/src/main/java/net/minecraft/server/HandshakeListener.java b/src/main/java/net/minecraft/server/HandshakeListener.java
+index 816210fb9..1ea9ed3c2 100644
+--- a/src/main/java/net/minecraft/server/HandshakeListener.java
++++ b/src/main/java/net/minecraft/server/HandshakeListener.java
+@@ -73,6 +73,7 @@ public class HandshakeListener implements PacketHandshakingInListener {
+                 this.b.close(chatmessage);
+             } else {
+                 this.b.setPacketListener(new LoginListener(this.a, this.b));
++                if (!com.destroystokyo.paper.PaperConfig.useVelocityProxy) { // Paper - don't fire when using velocity
+                 // Paper start - handshake event
+                 boolean proxyLogicEnabled = org.spigotmc.SpigotConfig.bungee;
+                 boolean handledByEvent = false;
+@@ -118,6 +119,11 @@ public class HandshakeListener implements PacketHandshakingInListener {
+                     }
+                 }
+                 // Spigot End
++                } else {
++                    ((LoginListener) this.b.i()).velocityPlayerInfoId = java.util.concurrent.ThreadLocalRandom.current().nextInt();
++                    ((LoginListener) this.b.i()).networkManager.sendPacket(new PacketLoginOutCustomPayload(((LoginListener) this.b.i()).velocityPlayerInfoId, LoginListener.VELOCITY_PLAYER_INFO, LoginListener.VELOCITY_PLAYER_INFO_BUF));
++                }
++                // Paper end - don't fire when using velocity
+                 ((LoginListener) this.b.i()).hostname = packethandshakinginsetprotocol.hostname + ":" + packethandshakinginsetprotocol.port; // CraftBukkit - set hostname
+             }
+             break;
+diff --git a/src/main/java/net/minecraft/server/LoginListener.java b/src/main/java/net/minecraft/server/LoginListener.java
+index bb33cf302..5a9de8cc6 100644
+--- a/src/main/java/net/minecraft/server/LoginListener.java
++++ b/src/main/java/net/minecraft/server/LoginListener.java
+@@ -43,6 +43,11 @@ public class LoginListener implements PacketLoginInListener, ITickable {
+     private SecretKey loginKey;
+     private EntityPlayer l;
+     public String hostname = ""; // CraftBukkit - add field
++    // Paper start - add fields
++    public static final MinecraftKey VELOCITY_PLAYER_INFO = new MinecraftKey("velocity", "player_info");
++    public static final PacketDataSerializer VELOCITY_PLAYER_INFO_BUF = new PacketDataSerializer(io.netty.buffer.Unpooled.EMPTY_BUFFER);
++    public int velocityPlayerInfoId;
++    // Paper end
+ 
+     public LoginListener(MinecraftServer minecraftserver, NetworkManager networkmanager) {
+         this.g = LoginListener.EnumProtocolState.HELLO;
+@@ -187,6 +192,7 @@ public class LoginListener implements PacketLoginInListener, ITickable {
+             this.g = LoginListener.EnumProtocolState.KEY;
+             this.networkManager.sendPacket(new PacketLoginOutEncryptionBegin("", this.server.G().getPublic(), this.e));
+         } else {
++            if (!com.destroystokyo.paper.PaperConfig.useVelocityProxy) // Paper - **INTENTIONALLY** not handling login
+             // Spigot start
+             // Paper start - Cache authenticator threads
+             authenticatorPool.execute(new Runnable() {
+@@ -325,6 +331,29 @@ public class LoginListener implements PacketLoginInListener, ITickable {
+     // Spigot end
+ 
+     public void a(PacketLoginInCustomPayload packetloginincustompayload) {
++        // Paper start - velocity support
++        if (com.destroystokyo.paper.PaperConfig.useVelocityProxy && packetloginincustompayload.getId() == this.velocityPlayerInfoId) {
++            final PacketDataSerializer buf = packetloginincustompayload.getBuf();
++            this.networkManager.l = new java.net.InetSocketAddress(buf.readUtf(32767), ((java.net.InetSocketAddress) this.networkManager.getSocketAddress()).getPort());
++            this.setGameProfile(new GameProfile(new UUID(buf.readLong(), buf.readLong()), buf.readUtf(16)));
++            final int properties = buf.readVarInt();
++            for(int i = 0; i < properties; i++) {
++                final String name = buf.readUtf(Short.MAX_VALUE);
++                final String value = buf.readUtf(Short.MAX_VALUE);
++                final String signature = buf.readBoolean() ? buf.readUtf(Short.MAX_VALUE) : null;
++                this.getGameProfile().getProperties().put(name, new com.mojang.authlib.properties.Property(name, value, signature));
++            }
++            authenticatorPool.execute(() -> {
++                try {
++                    new LoginHandler().fireEvents();
++                } catch (final Exception ex) {
++                    this.disconnect("Failed to verify username!");
++                    this.server.server.getLogger().log(java.util.logging.Level.WARNING, "Exception verifying " + this.i.getName(), ex);
++                }
++            });
++            return;
++        }
++        // Paper end
+         this.disconnect(new ChatMessage("multiplayer.disconnect.unexpected_query_response", new Object[0]));
+     }
+ 
+diff --git a/src/main/java/net/minecraft/server/PacketDataSerializer.java b/src/main/java/net/minecraft/server/PacketDataSerializer.java
+index d04afceb7..907dec1b3 100644
+--- a/src/main/java/net/minecraft/server/PacketDataSerializer.java
++++ b/src/main/java/net/minecraft/server/PacketDataSerializer.java
+@@ -139,6 +139,7 @@ public class PacketDataSerializer extends ByteBuf {
+         return this.d(oenum.ordinal());
+     }
+ 
++    public int readVarInt() { return this.g(); } // Paper - OBFHELPER
+     public int g() {
+         int i = 0;
+         int j = 0;
+@@ -278,6 +279,7 @@ public class PacketDataSerializer extends ByteBuf {
+         }
+     }
+ 
++    public String readUtf(final int maxLength) { return this.e(maxLength); } // Paper - OBFHELPER
+     public String e(int i) {
+         int j = this.g();
+ 
+diff --git a/src/main/java/net/minecraft/server/PacketLoginInCustomPayload.java b/src/main/java/net/minecraft/server/PacketLoginInCustomPayload.java
+index bdac03da4..71d37b795 100644
+--- a/src/main/java/net/minecraft/server/PacketLoginInCustomPayload.java
++++ b/src/main/java/net/minecraft/server/PacketLoginInCustomPayload.java
+@@ -4,8 +4,8 @@ import java.io.IOException;
+ 
+ public class PacketLoginInCustomPayload implements Packet<PacketLoginInListener> {
+ 
+-    private int a;
+-    private PacketDataSerializer b;
++    private int a; public int getId() { return this.a; } // Paper - OBFHELPER
++    private PacketDataSerializer b; public PacketDataSerializer getBuf() { return this.b; } // Paper - OBFHELPER
+ 
+     public PacketLoginInCustomPayload() {}
+ 
+diff --git a/src/main/java/net/minecraft/server/PacketLoginOutCustomPayload.java b/src/main/java/net/minecraft/server/PacketLoginOutCustomPayload.java
+index 345843a7f..7fa875cbf 100644
+--- a/src/main/java/net/minecraft/server/PacketLoginOutCustomPayload.java
++++ b/src/main/java/net/minecraft/server/PacketLoginOutCustomPayload.java
+@@ -10,6 +10,14 @@ public class PacketLoginOutCustomPayload implements Packet<PacketLoginOutListene
+ 
+     public PacketLoginOutCustomPayload() {}
+ 
++    // Paper start - add constructor
++    public PacketLoginOutCustomPayload(final int id, final MinecraftKey key, final PacketDataSerializer buf) {
++        this.a = id;
++        this.b = key;
++        this.c = buf;
++    }
++    // Paper end
++
+     public void a(PacketDataSerializer packetdataserializer) throws IOException {
+         this.a = packetdataserializer.g();
+         this.b = packetdataserializer.l();
+-- 
+2.18.0
+
